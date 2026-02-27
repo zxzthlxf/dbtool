@@ -1146,6 +1146,7 @@ WHERE s.name = SCHEMA_NAME() AND t.name = @p1`
 }
 
 // buildCreateTableDDL 根据源列类型及可选字段配置生成目标库建表语句（基础映射）
+// 对于 MySQL，会自动优化大字段类型以避免行大小超过 65535 字节限制
 func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string, opts copyTableOptions) (string, error) {
 	if table == "" {
 		return "", fmt.Errorf("表名不能为空")
@@ -1153,6 +1154,8 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 	if len(colTypes) == 0 {
 		return "", fmt.Errorf("列信息为空，无法建表")
 	}
+
+	driver = normalizeDriver(driver)
 
 	// 映射：源列名 => 自定义配置
 	colCfg := make(map[string]columnMapping)
@@ -1163,6 +1166,8 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 	}
 
 	var colsDDL []string
+	var estimatedRowSize int
+
 	for _, ct := range colTypes {
 		srcName := ct.Name()
 		cfg, hasCfg := colCfg[srcName]
@@ -1178,6 +1183,15 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 			targetType = strings.TrimSpace(cfg.TargetType)
 		} else {
 			targetType = mapColumnType(ct, driver)
+		}
+
+		// MySQL 特殊处理：预估行大小并优化大字段
+		if driver == "mysql" {
+			estimatedRowSize += estimateColumnSize(targetType)
+			// 如果预估行大小超过 60000 字节，将 VARCHAR 转为 TEXT
+			if estimatedRowSize > 60000 && strings.HasPrefix(targetType, "VARCHAR") {
+				targetType = "TEXT"
+			}
 		}
 
 		nullable := true
@@ -1200,6 +1214,70 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 
 	ddl := fmt.Sprintf("CREATE TABLE %s (\n  %s\n)", quoteIdent(table, driver), strings.Join(colsDDL, ",\n  "))
 	return ddl, nil
+}
+
+// estimateColumnSize 预估字段类型占用的字节数（MySQL）
+func estimateColumnSize(dbType string) int {
+	dbType = strings.ToUpper(dbType)
+	switch {
+	case strings.Contains(dbType, "TINYINT"):
+		return 1
+	case strings.Contains(dbType, "SMALLINT"):
+		return 2
+	case strings.Contains(dbType, "MEDIUMINT"):
+		return 3
+	case strings.Contains(dbType, "INT"):
+		return 4
+	case strings.Contains(dbType, "BIGINT"):
+		return 8
+	case strings.Contains(dbType, "FLOAT"):
+		return 4
+	case strings.Contains(dbType, "DOUBLE"):
+		return 8
+	case strings.Contains(dbType, "DECIMAL"), strings.Contains(dbType, "NUMERIC"):
+		// DECIMAL 预估 20 字节
+		return 20
+	case strings.Contains(dbType, "DATE"):
+		return 3
+	case strings.Contains(dbType, "TIME"):
+		return 3
+	case strings.Contains(dbType, "DATETIME"), strings.Contains(dbType, "TIMESTAMP"):
+		return 5
+	case strings.Contains(dbType, "YEAR"):
+		return 1
+	case strings.Contains(dbType, "CHAR"):
+		// 提取 CHAR(n) 中的 n
+		var n int
+		fmt.Sscanf(dbType, "CHAR(%d)", &n)
+		if n <= 0 {
+			n = 1
+		}
+		return n * 3 // utf8mb4 每个字符最多 4 字节，保守估计 3 字节
+	case strings.Contains(dbType, "VARCHAR"):
+		// 提取 VARCHAR(n) 中的 n
+		var n int
+		fmt.Sscanf(dbType, "VARCHAR(%d)", &n)
+		if n <= 0 {
+			n = 255
+		}
+		return n * 3 // utf8mb4 每个字符最多 4 字节，保守估计 3 字节
+	case strings.Contains(dbType, "TINYTEXT"):
+		return 255 // TEXT 类型只占用 9-12 字节行内存储
+	case strings.Contains(dbType, "TEXT"):
+		return 9 // TEXT 类型只占用 9-12 字节行内存储
+	case strings.Contains(dbType, "MEDIUMTEXT"), strings.Contains(dbType, "LONGTEXT"):
+		return 9 // TEXT 类型只占用 9-12 字节行内存储
+	case strings.Contains(dbType, "TINYBLOB"):
+		return 255
+	case strings.Contains(dbType, "BLOB"):
+		return 9
+	case strings.Contains(dbType, "MEDIUMBLOB"), strings.Contains(dbType, "LONGBLOB"):
+		return 9
+	case strings.Contains(dbType, "BOOL"):
+		return 1
+	default:
+		return 255 // 默认预估
+	}
 }
 
 // mapColumnType 做一个非常基础的类型映射（仅适合 demo，要在生产中使用需进一步完善）

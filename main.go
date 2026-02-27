@@ -79,6 +79,7 @@ type copyTableOptions struct {
 	IncrementalKey string // 增量同步的关键列名（如自增ID或时间戳）
 	Since          string // 大于该值的记录才会被同步（> Since）
 	Until          string // 小于等于该值的记录才会被同步（<= Until，可选）
+	SelectSQL      string // 自定义 SELECT 查询（优先级最高）
 }
 
 // configTable 定义单张表的配置
@@ -92,6 +93,7 @@ type configTable struct {
 	Since          string          `json:"since,omitempty"`
 	Until          string          `json:"until,omitempty"`
 	Columns        []columnMapping `json:"columns,omitempty"`
+	SelectSQL      string          `json:"select_sql,omitempty"` // 自定义 SELECT 查询（优先级最高）
 }
 
 // toolConfig 整体配置文件结构（支持新旧两种格式）
@@ -320,59 +322,58 @@ func runWithConfig(configPath string, cliDryRun bool) {
 			log.Fatalf("从源库获取表清单失败: %v", errList)
 		}
 
-		// 构建 list 中配置的表名映射（用于快速查找）
-		listTableMap := make(map[string]configTable)
+		// 构建 list 中配置的表名集合（用于快速查找）
+		// 注意：同一个 source_table 可能有多个配置（支持多次复制）
+		listTableSet := make(map[string]bool)
 		if cfg.TableList != nil {
 			for _, t := range cfg.TableList.List {
 				if strings.TrimSpace(t.SourceTable) != "" {
-					listTableMap[t.SourceTable] = t
+					listTableSet[t.SourceTable] = true
 				}
 			}
 		}
 
 		includeRe, excludeRe := compileTableFilters(cfg.TableList.Include, cfg.TableList.Exclude)
-		var filtered []string
-		for _, name := range names {
-			// 如果在 list 中明确配置了，不受 exclude 影响，直接使用 list 配置
-			if _, exists := listTableMap[name]; exists {
-				filtered = append(filtered, name)
-				continue
-			}
-			// 不在 list 中的表，应用 include/exclude 过滤规则
-			if matchTableFilters(name, includeRe, excludeRe) {
-				filtered = append(filtered, name)
+
+		// 先添加 list 中所有自定义配置的表（支持同一个表的多次复制）
+		tables = make([]configTable, 0)
+		if cfg.TableList != nil {
+			for _, t := range cfg.TableList.List {
+				if strings.TrimSpace(t.SourceTable) != "" {
+					entry := t
+					if entry.BatchSize <= 0 {
+						entry.BatchSize = 1000
+					}
+					tables = append(tables, entry)
+				}
 			}
 		}
 
-		tables = make([]configTable, 0, len(filtered))
+		// 然后添加通过 include/exclude 过滤的表（使用 defaults 配置）
 		defaults := cfg.TableList.Defaults
-		for _, t := range filtered {
-			// 如果在 list 中有自定义配置，使用 list 中的配置
-			if customConfig, exists := listTableMap[t]; exists {
-				entry := customConfig
-				if entry.BatchSize <= 0 {
-					entry.BatchSize = 1000
-				}
-				tables = append(tables, entry)
+		for _, name := range names {
+			// 如果在 list 中已经配置过了，跳过（避免重复）
+			if _, exists := listTableSet[name]; exists {
 				continue
 			}
-
-			// 否则使用 defaults 配置
-			entry := configTable{SourceTable: t, BatchSize: 1000}
-			if defaults != nil {
-				entry.TargetTable = defaults.TargetTable
-				entry.Where = defaults.Where
-				entry.BatchSize = defaults.BatchSize
-				entry.AutoCreate = defaults.AutoCreate
-				entry.IncrementalKey = defaults.IncrementalKey
-				entry.Since = defaults.Since
-				entry.Until = defaults.Until
-				entry.Columns = defaults.Columns
-				if defaults.BatchSize > 0 {
+			// 应用 include/exclude 过滤规则
+			if matchTableFilters(name, includeRe, excludeRe) {
+				entry := configTable{SourceTable: name, BatchSize: 1000}
+				if defaults != nil {
+					entry.TargetTable = defaults.TargetTable
+					entry.Where = defaults.Where
 					entry.BatchSize = defaults.BatchSize
+					entry.AutoCreate = defaults.AutoCreate
+					entry.IncrementalKey = defaults.IncrementalKey
+					entry.Since = defaults.Since
+					entry.Until = defaults.Until
+					entry.Columns = defaults.Columns
+					if defaults.BatchSize > 0 {
+						entry.BatchSize = defaults.BatchSize
+					}
 				}
+				tables = append(tables, entry)
 			}
-			tables = append(tables, entry)
 		}
 		log.Printf("从源库获取到 %d 张表\n", len(tables))
 	}
@@ -422,6 +423,7 @@ func runWithConfig(configPath string, cliDryRun bool) {
 			IncrementalKey: t.IncrementalKey,
 			Since:          t.Since,
 			Until:          t.Until,
+			SelectSQL:      t.SelectSQL,
 		}
 		if opts.BatchSize <= 0 {
 			opts.BatchSize = 1000
@@ -760,43 +762,67 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) (
 
 	// 获取源表记录数（用于数据核对）
 	var sourceCount int64
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", opts.Table)
-	var whereClause string
-	if strings.TrimSpace(opts.Where) != "" {
-		whereClause = " WHERE " + opts.Where
-	}
-	countQuery += whereClause
-	err := src.db.QueryRowContext(ctx, countQuery).Scan(&sourceCount)
-	if err != nil {
-		log.Printf("警告：无法获取源表记录数: %v\n", err)
-		sourceCount = -1
+	if strings.TrimSpace(opts.SelectSQL) != "" {
+		// 使用自定义 SELECT 查询时，通过子查询获取记录数
+		countQuery := "SELECT COUNT(*) FROM (" + opts.SelectSQL + ") AS tmp"
+		err := src.db.QueryRowContext(ctx, countQuery).Scan(&sourceCount)
+		if err != nil {
+			log.Printf("警告：无法获取源表记录数: %v\n", err)
+			sourceCount = -1
+		} else {
+			log.Printf("源表记录数: %d\n", sourceCount)
+		}
 	} else {
-		log.Printf("源表记录数: %d\n", sourceCount)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", opts.Table)
+		var whereClause string
+		if strings.TrimSpace(opts.Where) != "" {
+			whereClause = " WHERE " + opts.Where
+		}
+		countQuery += whereClause
+		err := src.db.QueryRowContext(ctx, countQuery).Scan(&sourceCount)
+		if err != nil {
+			log.Printf("警告：无法获取源表记录数: %v\n", err)
+			sourceCount = -1
+		} else {
+			log.Printf("源表记录数: %d\n", sourceCount)
+		}
 	}
 
-	// 构建 SELECT 列清单（支持字段映射）
-	selectCols := buildSelectColumns(opts)
+	var query string
+	var rows *sql.Rows
+	var err error
 
-	query := fmt.Sprintf("SELECT %s FROM %s", selectCols, opts.Table)
+	// 优先使用自定义 SELECT 查询
+	if strings.TrimSpace(opts.SelectSQL) != "" {
+		query = opts.SelectSQL
+		log.Printf("使用自定义 SELECT 查询\n")
+		rows, err = src.db.QueryContext(ctx, query)
+	} else {
+		// 构建 SELECT 列清单（支持字段映射）
+		selectCols := buildSelectColumns(opts)
 
-	// where 条件：用户自定义 + 增量条件
-	var whereClauses []string
-	if strings.TrimSpace(opts.Where) != "" {
-		whereClauses = append(whereClauses, "("+opts.Where+")")
-	}
-	if strings.TrimSpace(opts.IncrementalKey) != "" && strings.TrimSpace(opts.Since) != "" {
-		whereClauses = append(whereClauses,
-			fmt.Sprintf("%s > '%s'", quoteIdent(opts.IncrementalKey, src.cfg.Driver), opts.Since))
-	}
-	if strings.TrimSpace(opts.IncrementalKey) != "" && strings.TrimSpace(opts.Until) != "" {
-		whereClauses = append(whereClauses,
-			fmt.Sprintf("%s <= '%s'", quoteIdent(opts.IncrementalKey, src.cfg.Driver), opts.Until))
-	}
-	if len(whereClauses) > 0 {
-		query += " WHERE " + strings.Join(whereClauses, " AND ")
+		query = fmt.Sprintf("SELECT %s FROM %s", selectCols, opts.Table)
+
+		// where 条件：用户自定义 + 增量条件
+		var whereClauses []string
+		if strings.TrimSpace(opts.Where) != "" {
+			whereClauses = append(whereClauses, "("+opts.Where+")")
+		}
+		if strings.TrimSpace(opts.IncrementalKey) != "" && strings.TrimSpace(opts.Since) != "" {
+			whereClauses = append(whereClauses,
+				fmt.Sprintf("%s > '%s'", quoteIdent(opts.IncrementalKey, src.cfg.Driver), opts.Since))
+		}
+		if strings.TrimSpace(opts.IncrementalKey) != "" && strings.TrimSpace(opts.Until) != "" {
+			whereClauses = append(whereClauses,
+				fmt.Sprintf("%s <= '%s'", quoteIdent(opts.IncrementalKey, src.cfg.Driver), opts.Until))
+		}
+		if len(whereClauses) > 0 {
+			query += " WHERE " + strings.Join(whereClauses, " AND ")
+		}
+
+		rows, err = src.db.QueryContext(ctx, query)
 	}
 
-	rows, err := src.db.QueryContext(ctx, query)
 	if err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("查询源表失败: %w", err)
 	}

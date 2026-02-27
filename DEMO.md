@@ -255,7 +255,30 @@ go run -buildvcs=false ./dbtool -config .\dbtool\config.full.example.json -list-
 
 ### 6.4 使用自定义 SELECT 查询（复杂查询）
 
-**示例：**
+**示例 1：表对表复制（简单查询）**
+
+```json
+{
+  "source_table": "user1_src",
+  "target_table": "user1_dst1",
+  "batch_size": 10000,
+  "auto_create": true
+}
+```
+
+**示例 2：使用自定义 SELECT 查询（优先级最高）**
+
+```json
+{
+  "source_table": "user1_src",
+  "target_table": "user1_dst",
+  "select_sql": "SELECT id, name, email FROM user1_src WHERE status = 'active'",
+  "batch_size": 10000,
+  "auto_create": true
+}
+```
+
+**示例 3：复杂 JOIN 查询**
 
 ```json
 {
@@ -271,6 +294,8 @@ go run -buildvcs=false ./dbtool -config .\dbtool\config.full.example.json -list-
 - 需要关联多张表（JOIN）
 - 需要复杂的查询条件
 - 需要从关联表获取数据
+- 需要筛选特定字段
+- `select_sql` 优先级最高，会覆盖 `where` 和 `columns` 配置
 
 ### 6.5 使用自定义 SELECT 查询（聚合统计）
 
@@ -407,6 +432,38 @@ go run -buildvcs=false ./dbtool -config .\dbtool\config.custom.example.json
 }
 ```
 
+**示例 4：同一个表多次复制到不同目标**
+
+```json
+{
+  "table_list": {
+    "from_source": true,
+    "exclude": [".*"],
+    "list": [
+      {
+        "source_table": "users",
+        "target_table": "users_active",
+        "select_sql": "SELECT * FROM users WHERE status = 'active'"
+      },
+      {
+        "source_table": "users",
+        "target_table": "users_inactive",
+        "select_sql": "SELECT * FROM users WHERE status = 'inactive'"
+      },
+      {
+        "source_table": "users",
+        "target_table": "users_vip",
+        "select_sql": "SELECT * FROM users WHERE vip_level > 0"
+      }
+    ]
+  }
+}
+```
+
+**使用场景：**
+- 需要将同一张表的数据按条件拆分到不同目标表
+- 需要对同一张表进行多次不同条件的复制
+
 **命令：**
 
 ```powershell
@@ -432,8 +489,8 @@ go run -buildvcs=false ./dbtool -config .\dbtool\config.mixed.example.json
 | 自定义表清单   | `table_list.from_source: false` + `table_list.list` |
 | 从源库拉表清单 | `table_list.from_source: true`，可选 schema、include、exclude、defaults |
 | 全量表复制     | `table_list.from_source: true` + `table_list.defaults`，自动获取所有表 |
-| 全量+自定义混合 | `table_list.from_source: true` + `defaults` + `list`，`list` 中的表不受 `exclude` 影响，可灵活组合 |
-| 自定义 SELECT   | `select_sql` 字段，支持复杂查询、JOIN、聚合等 |
+| 全量+自定义混合 | `table_list.from_source: true` + `defaults` + `list`，`list` 中的表不受 `exclude` 影响，支持同一个表多次复制 |
+| 自定义 SELECT   | `select_sql` 字段，支持复杂查询、JOIN、聚合等（优先级最高，覆盖 where/columns） |
 | 字段映射       | `columns` 数组，支持重命名、类型转换 |
 | 增量同步       | `incremental_key` + `since` + `until`，按时间或ID增量同步 |
 | 迁移耗时汇总   | 每张表显示开始时间、结束时间、总耗时（秒/分钟） |

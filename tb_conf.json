@@ -1,0 +1,55 @@
+{
+  "comment": "自定义表复制配置示例 - 支持自定义 SELECT 查询和字段映射",
+  "sources": {
+    "src": {
+      "driver": "mysql",
+      "dsn": "root:Poc123123@tcp(10.80.30.9:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
+    },
+    "dst": {
+      "driver": "postgres",
+      "dsn": "postgres://test:Poc123123@10.80.30.9:5432/testdb?sslmode=disable"
+    },
+    "mssql_src": {
+      "driver": "sqlserver",
+      "dsn": "sqlserver://test:Poc123123@10.80.30.7:1433?database=run_6621_5bw"
+    },
+    "oracle_src": {
+      "driver": "oracle",
+      "dsn": "oracle://user:pass@host:1521/service_name"
+    }
+  },
+  "sync": {
+    "source": "src",
+    "target": "dst"
+  },
+  "table_list": {
+    "from_source": true,
+    "comment": "从源库自动获取所有表，但部分表使用自定义配置",
+    "schema": "",
+    "include": [],
+    "exclude": ["^tmp_", "^bak_","user1_src"],
+    "defaults": {
+      "comment": "大部分表使用的默认配置",
+      "batch_size": 10000,
+      "auto_create": true
+    },
+    "list": [
+	  {
+		"comment": "示例1: 使用自定义 SELECT 查询（优先级最高）",
+		"source_table": "user1_src",
+		"target_table": "user1_dst",
+		"select_sql": "SELECT id, name, email FROM user1_src",
+		"batch_size": 10000,
+		"auto_create": true
+	  },
+	  {
+		"comment": "示例2: 表对表",
+		"source_table": "user1_src",
+		"target_table": "user1_dst1",
+		"select_sql": "",
+		"batch_size": 10000,
+		"auto_create": true
+	  }
+    ]
+  }
+}

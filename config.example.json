@@ -1,0 +1,38 @@
+{
+  "source": {
+    "driver": "mysql",
+    "dsn": "root:Poc123123@tcp(10.80.30.9:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
+  },
+  "target": {
+    "driver": "postgres",
+    "dsn": "postgres://test:Poc123123@10.80.30.9:5432/testdb?sslmode=disable"
+  },
+  "tables": [
+    {
+      "source_table": "user1_src",
+      "target_table": "user1_tar",
+      "batch_size": 1000,
+      "auto_create": true,
+      "since": "1000",
+      "until": "2000",
+      "columns": [
+        { "source": "id", "target": "id" },
+        { "source": "name", "target": "username", "target_type": "VARCHAR(100)" },
+        { "source": "email", "target": "email", "target_type": "VARCHAR(255)" },
+        { "source": "created_at", "target": "created_at", "target_type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "source_table": "orders",
+      "auto_create": true,
+      "batch_size": 500,
+      "columns": [
+        { "source": "id", "target": "id" },
+        { "source": "user_id", "target": "user_id" },
+        { "source": "amount", "target": "amount" },
+        { "source": "created_at", "target": "created_at" }
+      ]
+    }
+  ]
+}
+

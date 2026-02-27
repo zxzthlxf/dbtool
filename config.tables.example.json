@@ -1,0 +1,37 @@
+{
+  "sources": {
+    "src": {
+      "driver": "mysql",
+      "dsn": "user:pass@tcp(127.0.0.1:3306)/db1?charset=utf8mb4&parseTime=True&loc=Local"
+    },
+    "dst": {
+      "driver": "postgres",
+      "dsn": "postgres://user:pass@localhost:5432/db2?sslmode=disable"
+    }
+  },
+  "sync": {
+    "source": "src",
+    "target": "dst"
+  },
+  "table_list": {
+    "from_source": false,
+    "list": [
+      {
+        "source_table": "users",
+        "target_table": "users_new",
+        "batch_size": 1000,
+        "auto_create": true,
+        "columns": [
+          { "source": "id", "target": "id" },
+          { "source": "name", "target": "username" },
+          { "source": "email", "target": "email" }
+        ]
+      },
+      {
+        "source_table": "orders",
+        "auto_create": true,
+        "batch_size": 500
+      }
+    ]
+  }
+}

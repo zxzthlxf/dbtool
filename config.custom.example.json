@@ -1,0 +1,93 @@
+{
+  "comment": "自定义表复制配置示例 - 支持自定义 SELECT 查询和字段映射",
+  "sources": {
+    "mysql_src": {
+      "driver": "mysql",
+      "dsn": "root:password@tcp(10.80.30.9:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
+    },
+    "postgres_dst": {
+      "driver": "postgres",
+      "dsn": "postgres://test:password@10.80.30.9:5432/testdb?sslmode=disable"
+    }
+  },
+  "sync": {
+    "source": "mysql_src",
+    "target": "postgres_dst"
+  },
+  "table_list": {
+    "from_source": false,
+    "comment": "使用自定义表清单，不从源库自动获取",
+    "list": [
+      {
+        "comment": "示例1: 使用自定义 SELECT 查询（优先级最高）",
+        "source_table": "users",
+        "target_table": "users_import",
+        "select_sql": "SELECT id, username, email, created_at FROM users WHERE status = 'active' ORDER BY id",
+        "batch_size": 5000,
+        "auto_create": true
+      },
+      {
+        "comment": "示例2: 使用表名 + 字段映射 + WHERE 条件",
+        "source_table": "orders",
+        "target_table": "orders_import",
+        "where": "status = 'completed' AND amount > 100",
+        "batch_size": 1000,
+        "auto_create": true,
+        "columns": [
+          { "source": "id", "target": "order_id" },
+          { "source": "user_id", "target": "customer_id" },
+          { "source": "amount", "target": "total_amount", "target_type": "DECIMAL(10,2)" },
+          { "source": "status", "target": "order_status", "target_type": "VARCHAR(50)" },
+          { "source": "created_at", "target": "order_date", "target_type": "TIMESTAMP" }
+        ]
+      },
+      {
+        "comment": "示例3: 使用表名 + 字段映射 + 增量同步",
+        "source_table": "products",
+        "target_table": "products_sync",
+        "incremental_key": "updated_at",
+        "since": "2024-01-01 00:00:00",
+        "until": "2024-12-31 23:59:59",
+        "batch_size": 2000,
+        "auto_create": true,
+        "columns": [
+          { "source": "id", "target": "product_id" },
+          { "source": "name", "target": "product_name", "target_type": "VARCHAR(255)" },
+          { "source": "price", "target": "price", "target_type": "DECIMAL(10,2)" },
+          { "source": "stock", "target": "stock_quantity", "target_type": "INT" },
+          { "source": "updated_at", "target": "last_updated", "target_type": "TIMESTAMP" }
+        ]
+      },
+      {
+        "comment": "示例4: 使用表名 + 字段映射（指定部分字段）",
+        "source_table": "logs",
+        "target_table": "logs_archive",
+        "where": "created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        "batch_size": 10000,
+        "auto_create": true,
+        "columns": [
+          { "source": "id", "target": "log_id" },
+          { "source": "user_id", "target": "user_id" },
+          { "source": "action", "target": "action_type", "target_type": "VARCHAR(100)" },
+          { "source": "created_at", "target": "log_time", "target_type": "TIMESTAMP" }
+        ]
+      },
+      {
+        "comment": "示例5: 使用自定义 SELECT 查询（复杂查询）",
+        "source_table": "orders",
+        "target_table": "order_summary",
+        "select_sql": "SELECT o.id, u.username, o.amount, o.status, o.created_at FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE o.created_at >= '2024-01-01'",
+        "batch_size": 3000,
+        "auto_create": true
+      },
+      {
+        "comment": "示例6: 使用自定义 SELECT 查询（聚合统计）",
+        "source_table": "orders",
+        "target_table": "daily_stats",
+        "select_sql": "SELECT DATE(created_at) as stat_date, COUNT(*) as order_count, SUM(amount) as total_amount FROM orders WHERE created_at >= '2024-01-01' GROUP BY DATE(created_at) ORDER BY stat_date",
+        "batch_size": 1000,
+        "auto_create": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "comment": "全量表复制配置示例 - 从源库自动获取所有表并复制到目标库",
+  "sources": {
+    "mysql_src": {
+      "driver": "mysql",
+      "dsn": "root:password@tcp(10.80.30.9:3306)/testdb?charset=utf8mb4&parseTime=True&loc=Local"
+    },
+    "postgres_dst": {
+      "driver": "postgres",
+      "dsn": "postgres://test:password@10.80.30.9:5432/testdb?sslmode=disable"
+    }
+  },
+  "sync": {
+    "source": "mysql_src",
+    "target": "postgres_dst"
+  },
+  "table_list": {
+    "from_source": true,
+    "comment": "从源库自动获取所有表",
+    "schema": "",
+    "include": [],
+    "exclude": [],
+    "defaults": {
+      "comment": "所有表的默认配置",
+      "batch_size": 10000,
+      "auto_create": true
+    }
+  }
+}

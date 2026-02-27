@@ -275,9 +275,20 @@ func main() {
 		Until:          *until,
 	}
 
-	if err := copyTable(context.Background(), src, dst, opts); err != nil {
+	_, _, _, _, err = copyTable(context.Background(), src, dst, opts)
+	if err != nil {
 		log.Fatalf("拷贝表数据失败: %v", err)
 	}
+}
+
+// tableVerificationResult 记录单张表的数据核对结果
+type tableVerificationResult struct {
+	TableName     string
+	SourceCount   int64
+	TargetCount   int64
+	MigratedCount int64
+	Diff          int64
+	HasDiff       bool
 }
 
 // runWithConfig 使用 JSON 配置文件执行多表同步
@@ -308,16 +319,45 @@ func runWithConfig(configPath string, cliDryRun bool) {
 		if errList != nil {
 			log.Fatalf("从源库获取表清单失败: %v", errList)
 		}
+
+		// 构建 list 中配置的表名映射（用于快速查找）
+		listTableMap := make(map[string]configTable)
+		if cfg.TableList != nil {
+			for _, t := range cfg.TableList.List {
+				if strings.TrimSpace(t.SourceTable) != "" {
+					listTableMap[t.SourceTable] = t
+				}
+			}
+		}
+
 		includeRe, excludeRe := compileTableFilters(cfg.TableList.Include, cfg.TableList.Exclude)
 		var filtered []string
 		for _, name := range names {
+			// 如果在 list 中明确配置了，不受 exclude 影响，直接使用 list 配置
+			if _, exists := listTableMap[name]; exists {
+				filtered = append(filtered, name)
+				continue
+			}
+			// 不在 list 中的表，应用 include/exclude 过滤规则
 			if matchTableFilters(name, includeRe, excludeRe) {
 				filtered = append(filtered, name)
 			}
 		}
+
 		tables = make([]configTable, 0, len(filtered))
 		defaults := cfg.TableList.Defaults
 		for _, t := range filtered {
+			// 如果在 list 中有自定义配置，使用 list 中的配置
+			if customConfig, exists := listTableMap[t]; exists {
+				entry := customConfig
+				if entry.BatchSize <= 0 {
+					entry.BatchSize = 1000
+				}
+				tables = append(tables, entry)
+				continue
+			}
+
+			// 否则使用 defaults 配置
 			entry := configTable{SourceTable: t, BatchSize: 1000}
 			if defaults != nil {
 				entry.TargetTable = defaults.TargetTable
@@ -355,6 +395,17 @@ func runWithConfig(configPath string, cliDryRun bool) {
 	}
 	defer dst.Close()
 
+	// 收集所有表的数据核对结果
+	var verificationResults []tableVerificationResult
+	var totalSourceCount int64
+	var totalTargetCount int64
+	var totalMigratedCount int64
+	var totalDiff int64
+	var diffTableCount int
+
+	// 记录总开始时间
+	totalStartTime := time.Now()
+
 	for i, t := range tables {
 		if strings.TrimSpace(t.SourceTable) == "" {
 			log.Printf("第 %d 个表配置 source_table 为空，跳过", i)
@@ -379,10 +430,84 @@ func runWithConfig(configPath string, cliDryRun bool) {
 		log.Printf("开始根据配置同步表: source=%s, target=%s\n",
 			opts.Table, firstNonEmpty(opts.TargetTable, opts.Table))
 
-		if err := copyTable(context.Background(), src, dst, opts); err != nil {
+		migratedCount, sourceCount, targetCount, _, err := copyTable(context.Background(), src, dst, opts)
+		if err != nil {
 			log.Fatalf("表 %s 同步失败: %v", opts.Table, err)
 		}
+
+		// 收集核对数据
+		result := tableVerificationResult{
+			TableName:     opts.Table,
+			SourceCount:   sourceCount,
+			TargetCount:   targetCount,
+			MigratedCount: migratedCount,
+		}
+		if sourceCount >= 0 && targetCount >= 0 {
+			result.Diff = targetCount - sourceCount
+			result.HasDiff = result.Diff != 0
+			if result.HasDiff {
+				diffTableCount++
+			}
+		}
+		verificationResults = append(verificationResults, result)
+
+		// 累加总计
+		if sourceCount >= 0 {
+			totalSourceCount += sourceCount
+		}
+		if targetCount >= 0 {
+			totalTargetCount += targetCount
+		}
+		totalMigratedCount += migratedCount
 	}
+
+	// 计算总体差异和总耗时
+	totalDiff = totalTargetCount - totalSourceCount
+	totalDuration := time.Since(totalStartTime)
+	totalDurationSeconds := totalDuration.Seconds()
+	totalEndTime := time.Now()
+
+	// 打印总体数据核对汇总报告
+	log.Printf("\n")
+	log.Printf("########################################\n")
+	log.Printf("总体数据核对汇总报告\n")
+	log.Printf("########################################\n")
+	log.Printf("总表数: %d\n", len(verificationResults))
+	log.Printf("存在差异的表数: %d\n", diffTableCount)
+	log.Printf("\n")
+	log.Printf("时间统计:\n")
+	log.Printf("  开始时间: %s\n", totalStartTime.Format("2006-01-02 15:04:05"))
+	log.Printf("  结束时间: %s\n", totalEndTime.Format("2006-01-02 15:04:05"))
+	log.Printf("  总迁移耗时: %.2f 秒 (%.2f 分钟)\n", totalDurationSeconds, totalDurationSeconds/60)
+	log.Printf("  源库总记录数: %d\n", totalSourceCount)
+	log.Printf("  目标库总记录数: %d\n", totalTargetCount)
+	log.Printf("  迁移总记录数: %d\n", totalMigratedCount)
+	log.Printf("  总体差异: %d\n", totalDiff)
+	if totalDiff == 0 {
+		log.Printf("  数据核对结果: ✅ 无差异\n")
+	} else if totalDiff > 0 {
+		log.Printf("  数据核对结果: ⚠️ 目标库比源库多 %d 条\n", totalDiff)
+	} else {
+		log.Printf("  数据核对结果: ❌ 目标库比源库少 %d 条\n", -totalDiff)
+	}
+
+	// 打印存在差异的表详情
+	if diffTableCount > 0 {
+		log.Printf("\n")
+		log.Printf("存在差异的表详情:\n")
+		for _, result := range verificationResults {
+			if result.HasDiff {
+				if result.Diff > 0 {
+					log.Printf("  ❌ %s: 源库 %d 条, 目标库 %d 条, 多 %d 条\n",
+						result.TableName, result.SourceCount, result.TargetCount, result.Diff)
+				} else {
+					log.Printf("  ❌ %s: 源库 %d 条, 目标库 %d 条, 少 %d 条\n",
+						result.TableName, result.SourceCount, result.TargetCount, -result.Diff)
+				}
+			}
+		}
+	}
+	log.Printf("########################################\n")
 }
 
 // compileTableFilters 编译 include/exclude 为正则
@@ -620,7 +745,8 @@ func runListTables(configPath string) {
 
 // copyTable 将源数据库中的某个表的数据复制到目标数据库
 // 假设源表和目标表结构一致（列名相同，顺序相同或可以自动检测）
-func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) error {
+// 返回：迁移记录数、源表记录数、目标表记录数、耗时（秒）、错误
+func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) (int64, int64, int64, float64, error) {
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 1000
 	}
@@ -672,27 +798,27 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 
 	rows, err := src.db.QueryContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("查询源表失败: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("查询源表失败: %w", err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return fmt.Errorf("获取列信息失败: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("获取列信息失败: %w", err)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("表 %s 无任何列", opts.Table)
+		return 0, 0, 0, 0, fmt.Errorf("表 %s 无任何列", opts.Table)
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return fmt.Errorf("获取列类型信息失败: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("获取列类型信息失败: %w", err)
 	}
 
 	// 自动建表
 	if opts.AutoCreate {
 		if err := ensureTargetTable(ctx, dst, targetTable, colTypes, opts); err != nil {
-			return fmt.Errorf("自动建表失败: %w", err)
+			return 0, 0, 0, 0, fmt.Errorf("自动建表失败: %w", err)
 		}
 	}
 
@@ -701,7 +827,7 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 
 	insertSQL, err := buildInsertSQL(targetTable, insertColumns, dst.cfg.Driver)
 	if err != nil {
-		return err
+		return 0, 0, 0, 0, err
 	}
 
 	if opts.DryRun {
@@ -711,7 +837,7 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 
 	tx, err := dst.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("开启目标库事务失败: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("开启目标库事务失败: %w", err)
 	}
 	defer func() {
 		// 若外部没有提交，则回滚
@@ -730,7 +856,7 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 			valuePtrs[i] = &valueHolders[i]
 		}
 		if err := rows.Scan(valuePtrs...); err != nil {
-			return fmt.Errorf("扫描源表行失败: %w", err)
+			return 0, 0, 0, 0, fmt.Errorf("扫描源表行失败: %w", err)
 		}
 
 		// 根据字段映射重排参数顺序
@@ -743,7 +869,7 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 			}
 		} else {
 			if _, err := tx.ExecContext(ctx, insertSQL, args...); err != nil {
-				return fmt.Errorf("插入目标库失败: %w", err)
+				return 0, 0, 0, 0, fmt.Errorf("插入目标库失败: %w", err)
 			}
 		}
 
@@ -752,25 +878,25 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 
 		if !opts.DryRun && batchCount >= opts.BatchSize {
 			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("提交事务失败: %w", err)
+				return 0, 0, 0, 0, fmt.Errorf("提交事务失败: %w", err)
 			}
 			log.Printf("已提交 %d 条记录\n", count)
 			// 开启新的事务
 			tx, err = dst.db.BeginTx(ctx, nil)
 			if err != nil {
-				return fmt.Errorf("开启新事务失败: %w", err)
+				return 0, 0, 0, 0, fmt.Errorf("开启新事务失败: %w", err)
 			}
 			batchCount = 0
 		}
 	}
 
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("遍历源表行时出错: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("遍历源表行时出错: %w", err)
 	}
 
 	if !opts.DryRun {
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("最终提交事务失败: %w", err)
+			return 0, 0, 0, 0, fmt.Errorf("最终提交事务失败: %w", err)
 		}
 	}
 
@@ -814,7 +940,7 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 	}
 	log.Printf("========================================\n")
 
-	return nil
+	return int64(count), sourceCount, targetCount, durationSeconds, nil
 }
 
 // buildSelectColumns 根据配置构建 SELECT 的列清单

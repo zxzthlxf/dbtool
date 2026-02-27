@@ -97,9 +97,9 @@ type configTable struct {
 // toolConfig 整体配置文件结构（支持新旧两种格式）
 type toolConfig struct {
 	// 旧版：直接 source/target + tables 数组
-	Source *dbConfig      `json:"source,omitempty"`
-	Target *dbConfig      `json:"target,omitempty"`
-	Tables []configTable  `json:"tables,omitempty"` // 旧版表清单
+	Source *dbConfig     `json:"source,omitempty"`
+	Target *dbConfig     `json:"target,omitempty"`
+	Tables []configTable `json:"tables,omitempty"` // 旧版表清单
 
 	// 新版：命名数据源 + 表清单（从源库全量或自定义）
 	Sources map[string]dbConfig `json:"sources,omitempty"`
@@ -110,7 +110,7 @@ type toolConfig struct {
 	TableList *struct {
 		FromSource bool          `json:"from_source,omitempty"` // true=从源库查询全量表
 		Schema     string        `json:"schema,omitempty"`      // 可选 schema（mssql/oracle/postgres）
-		Include    []string      `json:"include,omitempty"`      // 表名匹配（正则），为空表示全部
+		Include    []string      `json:"include,omitempty"`     // 表名匹配（正则），为空表示全部
 		Exclude    []string      `json:"exclude,omitempty"`     // 排除表名（正则）
 		Defaults   *configTable  `json:"defaults,omitempty"`    // 从源拉表时的默认配置
 		List       []configTable `json:"list,omitempty"`        // 自定义表清单
@@ -627,7 +627,26 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 
 	targetTable := firstNonEmpty(opts.TargetTable, opts.Table)
 
+	// 记录开始时间
+	startTime := time.Now()
 	log.Printf("开始复制表 %s -> %s ...\n", opts.Table, targetTable)
+	log.Printf("开始时间: %s\n", startTime.Format("2006-01-02 15:04:05"))
+
+	// 获取源表记录数（用于数据核对）
+	var sourceCount int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", opts.Table)
+	var whereClause string
+	if strings.TrimSpace(opts.Where) != "" {
+		whereClause = " WHERE " + opts.Where
+	}
+	countQuery += whereClause
+	err := src.db.QueryRowContext(ctx, countQuery).Scan(&sourceCount)
+	if err != nil {
+		log.Printf("警告：无法获取源表记录数: %v\n", err)
+		sourceCount = -1
+	} else {
+		log.Printf("源表记录数: %d\n", sourceCount)
+	}
 
 	// 构建 SELECT 列清单（支持字段映射）
 	selectCols := buildSelectColumns(opts)
@@ -755,7 +774,46 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 		}
 	}
 
-	log.Printf("表 %s 复制完成，总共处理 %d 条记录\n", opts.Table, count)
+	// 获取目标表记录数（用于数据核对）
+	var targetCount int64
+	targetCountQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(targetTable, dst.cfg.Driver))
+	err = dst.db.QueryRowContext(ctx, targetCountQuery).Scan(&targetCount)
+	if err != nil {
+		log.Printf("警告：无法获取目标表记录数: %v\n", err)
+		targetCount = -1
+	} else {
+		log.Printf("目标表记录数: %d\n", targetCount)
+	}
+
+	// 计算结束时间和总耗时
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	durationSeconds := duration.Seconds()
+
+	// 打印汇总信息
+	log.Printf("========================================\n")
+	log.Printf("表 %s 迁移完成\n", opts.Table)
+	log.Printf("========================================\n")
+	log.Printf("开始时间: %s\n", startTime.Format("2006-01-02 15:04:05"))
+	log.Printf("结束时间: %s\n", endTime.Format("2006-01-02 15:04:05"))
+	log.Printf("总耗时: %.2f 秒 (%.2f 分钟)\n", durationSeconds, durationSeconds/60)
+	log.Printf("源表记录数: %d\n", sourceCount)
+	log.Printf("目标表记录数: %d\n", targetCount)
+	log.Printf("迁移记录数: %d\n", count)
+
+	// 数据核对
+	if sourceCount >= 0 && targetCount >= 0 {
+		diff := targetCount - sourceCount
+		if diff == 0 {
+			log.Printf("数据核对: ✅ 无差异（源表 %d 条，目标表 %d 条）\n", sourceCount, targetCount)
+		} else if diff > 0 {
+			log.Printf("数据核对: ⚠️ 目标表比源表多 %d 条（可能存在重复数据或源表有删除）\n", diff)
+		} else {
+			log.Printf("数据核对: ❌ 目标表比源表少 %d 条（可能存在数据丢失）\n", -diff)
+		}
+	}
+	log.Printf("========================================\n")
+
 	return nil
 }
 
@@ -1152,4 +1210,3 @@ func quoteIdent(name, driver string) string {
 		return "`" + name + "`"
 	}
 }
-

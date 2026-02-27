@@ -1166,7 +1166,13 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 	}
 
 	var colsDDL []string
-	var estimatedRowSize int
+
+	// MySQL 特殊处理：如果字段数超过 30 个，将所有 VARCHAR/CHAR 转为 TEXT
+	// 这样可以避免行大小超过 65535 字节限制
+	useTextForLargeFields := driver == "mysql" && len(colTypes) > 30
+	if useTextForLargeFields {
+		log.Printf("表 %s 字段数较多(%d个)，将自动将 VARCHAR/CHAR 转为 TEXT 以避免行大小限制\n", table, len(colTypes))
+	}
 
 	for _, ct := range colTypes {
 		srcName := ct.Name()
@@ -1185,13 +1191,10 @@ func buildCreateTableDDL(table string, colTypes []*sql.ColumnType, driver string
 			targetType = mapColumnType(ct, driver)
 		}
 
-		// MySQL 特殊处理：预估行大小并优化大字段
-		if driver == "mysql" {
-			estimatedRowSize += estimateColumnSize(targetType)
-			// 如果预估行大小超过 60000 字节，将 VARCHAR 转为 TEXT
-			if estimatedRowSize > 60000 && strings.HasPrefix(targetType, "VARCHAR") {
-				targetType = "TEXT"
-			}
+		// MySQL 特殊处理：如果字段数较多，将 VARCHAR/CHAR 转为 TEXT
+		// 注意：TEXT 类型只占用 9-12 字节行内存储，不计入行大小限制
+		if useTextForLargeFields && (strings.HasPrefix(targetType, "VARCHAR") || strings.HasPrefix(targetType, "CHAR")) {
+			targetType = "TEXT"
 		}
 
 		nullable := true

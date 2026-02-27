@@ -3,20 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	_ "github.com/microsoft/go-mssqldb"
@@ -40,11 +37,11 @@ func newSimpleDB(cfg dbConfig) (*simpleDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败 (%s): %w", cfg.Driver, err)
 	}
-	db.SetMaxOpenConns(50)
-	db.SetMaxIdleConns(25)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -100,9 +97,9 @@ type configTable struct {
 // toolConfig 整体配置文件结构（支持新旧两种格式）
 type toolConfig struct {
 	// 旧版：直接 source/target + tables 数组
-	Source *dbConfig     `json:"source,omitempty"`
-	Target *dbConfig     `json:"target,omitempty"`
-	Tables []configTable `json:"tables,omitempty"` // 旧版表清单
+	Source *dbConfig      `json:"source,omitempty"`
+	Target *dbConfig      `json:"target,omitempty"`
+	Tables []configTable  `json:"tables,omitempty"` // 旧版表清单
 
 	// 新版：命名数据源 + 表清单（从源库全量或自定义）
 	Sources map[string]dbConfig `json:"sources,omitempty"`
@@ -113,7 +110,7 @@ type toolConfig struct {
 	TableList *struct {
 		FromSource bool          `json:"from_source,omitempty"` // true=从源库查询全量表
 		Schema     string        `json:"schema,omitempty"`      // 可选 schema（mssql/oracle/postgres）
-		Include    []string      `json:"include,omitempty"`     // 表名匹配（正则），为空表示全部
+		Include    []string      `json:"include,omitempty"`      // 表名匹配（正则），为空表示全部
 		Exclude    []string      `json:"exclude,omitempty"`     // 排除表名（正则）
 		Defaults   *configTable  `json:"defaults,omitempty"`    // 从源拉表时的默认配置
 		List       []configTable `json:"list,omitempty"`        // 自定义表清单
@@ -625,7 +622,7 @@ func runListTables(configPath string) {
 // 假设源表和目标表结构一致（列名相同，顺序相同或可以自动检测）
 func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) error {
 	if opts.BatchSize <= 0 {
-		opts.BatchSize = 10000
+		opts.BatchSize = 1000
 	}
 
 	targetTable := firstNonEmpty(opts.TargetTable, opts.Table)
@@ -683,16 +680,83 @@ func copyTable(ctx context.Context, src, dst *simpleDB, opts copyTableOptions) e
 	// 根据字段映射决定插入列
 	insertColumns := buildInsertColumns(cols, opts)
 
-	// 根据目标数据库类型选择最优导入方式
-	driver := normalizeDriver(dst.cfg.Driver)
-	if driver == "postgres" || driver == "postgresql" {
-		return copyTableWithCOPY(ctx, src, dst, rows, cols, insertColumns, targetTable, opts)
-	} else if driver == "mysql" {
-		return copyTableWithLOADDATA(ctx, src, dst, rows, cols, insertColumns, targetTable, opts)
+	insertSQL, err := buildInsertSQL(targetTable, insertColumns, dst.cfg.Driver)
+	if err != nil {
+		return err
 	}
 
-	// 其他数据库使用传统 INSERT 方式
-	return copyTableWithInsert(ctx, src, dst, rows, cols, insertColumns, targetTable, opts)
+	if opts.DryRun {
+		log.Println("Dry-Run 模式，仅打印将执行的 INSERT SQL：")
+		log.Println(insertSQL)
+	}
+
+	tx, err := dst.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启目标库事务失败: %w", err)
+	}
+	defer func() {
+		// 若外部没有提交，则回滚
+		_ = tx.Rollback()
+	}()
+
+	valuePtrs := make([]interface{}, len(cols))
+	valueHolders := make([]interface{}, len(cols))
+
+	count := 0
+	batchCount := 0
+
+	for rows.Next() {
+		for i := range valueHolders {
+			valueHolders[i] = nil
+			valuePtrs[i] = &valueHolders[i]
+		}
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return fmt.Errorf("扫描源表行失败: %w", err)
+		}
+
+		// 根据字段映射重排参数顺序
+		args := reorderArgs(cols, insertColumns, valueHolders, opts)
+
+		if opts.DryRun {
+			// 仅打印一部分示例数据，避免日志过大
+			if count < 5 {
+				log.Printf("示例行 %d: %v\n", count+1, args)
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, insertSQL, args...); err != nil {
+				return fmt.Errorf("插入目标库失败: %w", err)
+			}
+		}
+
+		count++
+		batchCount++
+
+		if !opts.DryRun && batchCount >= opts.BatchSize {
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("提交事务失败: %w", err)
+			}
+			log.Printf("已提交 %d 条记录\n", count)
+			// 开启新的事务
+			tx, err = dst.db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("开启新事务失败: %w", err)
+			}
+			batchCount = 0
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("遍历源表行时出错: %w", err)
+	}
+
+	if !opts.DryRun {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("最终提交事务失败: %w", err)
+		}
+	}
+
+	log.Printf("表 %s 复制完成，总共处理 %d 条记录\n", opts.Table, count)
+	return nil
 }
 
 // buildSelectColumns 根据配置构建 SELECT 的列清单
@@ -781,33 +845,19 @@ func reorderArgs(sourceCols, insertCols []string, values []interface{}, opts cop
 		// 优先通过字段映射找到源列名
 		if srcCol, ok := targetToSource[targetCol]; ok {
 			if idx, ok2 := sourceIndex[srcCol]; ok2 {
-				args = append(args, convertValueForCOPY(values[idx]))
+				args = append(args, values[idx])
 				continue
 			}
 		}
 		// 若无映射，则尝试目标列名与源列名相同
 		if idx, ok := sourceIndex[targetCol]; ok {
-			args = append(args, convertValueForCOPY(values[idx]))
+			args = append(args, values[idx])
 			continue
 		}
 		// 找不到对应列，填 nil（通常是用户在配置中定义了常量列或目标多余列）
 		args = append(args, nil)
 	}
 	return args
-}
-
-// convertValueForCOPY 将值转换为适合 COPY 命令的类型
-func convertValueForCOPY(v interface{}) interface{} {
-	if v == nil {
-		return nil
-	}
-
-	switch val := v.(type) {
-	case []byte:
-		return string(val)
-	default:
-		return v
-	}
 }
 
 // ensureTargetTable 在目标库中确保表存在，若不存在则根据源列类型创建
@@ -1072,48 +1122,6 @@ func buildInsertSQL(table string, columns []string, driver string) (string, erro
 	return sqlStr, nil
 }
 
-// buildMultiInsertSQL 生成批量 INSERT 语句（用于 MySQL 和 PostgreSQL）
-func buildMultiInsertSQL(table string, columns []string, batchSize int, driver string) (string, error) {
-	if table == "" {
-		return "", fmt.Errorf("表名不能为空")
-	}
-	if len(columns) == 0 {
-		return "", fmt.Errorf("列名不能为空")
-	}
-
-	colList := make([]string, len(columns))
-	for i, c := range columns {
-		colList[i] = quoteIdent(c, driver)
-	}
-
-	var valuePlaceholders []string
-	switch normalizeDriver(driver) {
-	case "postgres", "postgresql":
-		for b := 0; b < batchSize; b++ {
-			rowValues := make([]string, len(columns))
-			for i := range columns {
-				rowValues[i] = fmt.Sprintf("$%d", b*len(columns)+i+1)
-			}
-			valuePlaceholders = append(valuePlaceholders, "("+strings.Join(rowValues, ", ")+")")
-		}
-	default:
-		for b := 0; b < batchSize; b++ {
-			rowValues := make([]string, len(columns))
-			for i := range columns {
-				rowValues[i] = "?"
-			}
-			valuePlaceholders = append(valuePlaceholders, "("+strings.Join(rowValues, ", ")+")")
-		}
-	}
-
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-		quoteIdent(table, driver),
-		strings.Join(colList, ", "),
-		strings.Join(valuePlaceholders, ", "),
-	)
-	return sqlStr, nil
-}
-
 // quoteIdent 对表名/列名做简单转义（演示用，未覆盖所有情况）
 func quoteIdent(name, driver string) string {
 	name = strings.TrimSpace(name)
@@ -1145,392 +1153,3 @@ func quoteIdent(name, driver string) string {
 	}
 }
 
-// copyTableWithCOPY 使用 PostgreSQL COPY FROM 命令批量导入数据（性能最优）
-func copyTableWithCOPY(ctx context.Context, src, dst *simpleDB, rows *sql.Rows, cols, insertColumns []string, targetTable string, opts copyTableOptions) error {
-	log.Printf("使用 PostgreSQL COPY 命令进行高速导入\n")
-
-	if opts.DryRun {
-		log.Println("Dry-Run 模式，仅打印将执行的 COPY SQL")
-		colList := make([]string, len(insertColumns))
-		for i, c := range insertColumns {
-			colList[i] = quoteIdent(c, dst.cfg.Driver)
-		}
-		copySQL := fmt.Sprintf("COPY %s (%s) FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
-			quoteIdent(targetTable, dst.cfg.Driver),
-			strings.Join(colList, ", "))
-		log.Println(copySQL)
-		return nil
-	}
-
-	tx, err := dst.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
-	}
-
-	stmt, err := tx.Prepare(pq.CopyIn(targetTable, insertColumns...))
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("准备 COPY 语句失败: %w", err)
-	}
-
-	valuePtrs := make([]interface{}, len(cols))
-	valueHolders := make([]interface{}, len(cols))
-
-	count := 0
-	batchCount := 0
-	startTime := time.Now()
-
-	for rows.Next() {
-		for i := range valueHolders {
-			valueHolders[i] = nil
-			valuePtrs[i] = &valueHolders[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			stmt.Close()
-			tx.Rollback()
-			return fmt.Errorf("扫描源表行失败: %w", err)
-		}
-
-		args := reorderArgs(cols, insertColumns, valueHolders, opts)
-
-		if _, err := stmt.Exec(args...); err != nil {
-			stmt.Close()
-			tx.Rollback()
-			return fmt.Errorf("写入 COPY 数据失败: %w", err)
-		}
-
-		count++
-		batchCount++
-
-		if batchCount >= opts.BatchSize {
-			if _, err := stmt.Exec(); err != nil {
-				stmt.Close()
-				tx.Rollback()
-				return fmt.Errorf("结束 COPY 批次失败: %w", err)
-			}
-
-			if err := stmt.Close(); err != nil {
-				tx.Rollback()
-				return fmt.Errorf("关闭 COPY 语句失败: %w", err)
-			}
-
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("提交事务失败: %w", err)
-			}
-
-			elapsed := time.Since(startTime)
-			rate := float64(batchCount) / elapsed.Seconds()
-			log.Printf("已处理 %d 条记录 (速度: %.0f 条/秒)\n", count, rate)
-
-			tx, err = dst.db.BeginTx(ctx, nil)
-			if err != nil {
-				return fmt.Errorf("开启新事务失败: %w", err)
-			}
-
-			stmt, err = tx.Prepare(pq.CopyIn(targetTable, insertColumns...))
-			if err != nil {
-				tx.Rollback()
-				return fmt.Errorf("准备新 COPY 语句失败: %w", err)
-			}
-
-			batchCount = 0
-			startTime = time.Now()
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		stmt.Close()
-		tx.Rollback()
-		return fmt.Errorf("遍历源表行时出错: %w", err)
-	}
-
-	if _, err := stmt.Exec(); err != nil {
-		stmt.Close()
-		tx.Rollback()
-		return fmt.Errorf("结束 COPY 批次失败: %w", err)
-	}
-
-	if err := stmt.Close(); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("关闭 COPY 语句失败: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("最终提交事务失败: %w", err)
-	}
-
-	log.Printf("表 %s 复制完成，总共处理 %d 条记录\n", opts.Table, count)
-	return nil
-}
-
-// copyTableWithLOADDATA 使用 MySQL LOAD DATA INFILE 命令批量导入数据（性能最优）
-func copyTableWithLOADDATA(ctx context.Context, src, dst *simpleDB, rows *sql.Rows, cols, insertColumns []string, targetTable string, opts copyTableOptions) error {
-	log.Printf("使用 MySQL LOAD DATA INFILE 命令进行高速导入\n")
-
-	if opts.DryRun {
-		log.Println("Dry-Run 模式，仅打印将执行的 LOAD DATA SQL")
-		colList := make([]string, len(insertColumns))
-		for i, c := range insertColumns {
-			colList[i] = quoteIdent(c, dst.cfg.Driver)
-		}
-		loadSQL := fmt.Sprintf("LOAD DATA LOCAL INFILE 'temp.csv' INTO TABLE %s (%s) FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n'",
-			quoteIdent(targetTable, dst.cfg.Driver),
-			strings.Join(colList, ", "))
-		log.Println(loadSQL)
-		return nil
-	}
-
-	tmpDir := os.TempDir()
-	tmpFile := filepath.Join(tmpDir, fmt.Sprintf("dbtool_%s_%d.csv", targetTable, time.Now().UnixNano()))
-
-	csvFile, err := os.Create(tmpFile)
-	if err != nil {
-		return fmt.Errorf("创建临时 CSV 文件失败: %w", err)
-	}
-	defer func() {
-		csvFile.Close()
-		os.Remove(tmpFile)
-	}()
-
-	csvWriter := csv.NewWriter(csvFile)
-	csvWriter.Comma = ','
-	csvWriter.UseCRLF = false
-
-	valuePtrs := make([]interface{}, len(cols))
-	valueHolders := make([]interface{}, len(cols))
-
-	count := 0
-	batchCount := 0
-	startTime := time.Now()
-
-	for rows.Next() {
-		for i := range valueHolders {
-			valueHolders[i] = nil
-			valuePtrs[i] = &valueHolders[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return fmt.Errorf("扫描源表行失败: %w", err)
-		}
-
-		args := reorderArgs(cols, insertColumns, valueHolders, opts)
-
-		record := make([]string, len(args))
-		for i, v := range args {
-			record[i] = formatValueForCSV(v)
-		}
-
-		if err := csvWriter.Write(record); err != nil {
-			return fmt.Errorf("写入 CSV 数据失败: %w", err)
-		}
-
-		count++
-		batchCount++
-
-		if batchCount >= opts.BatchSize {
-			csvWriter.Flush()
-			if err := csvWriter.Error(); err != nil {
-				return fmt.Errorf("刷新 CSV 数据失败: %w", err)
-			}
-
-			colList := make([]string, len(insertColumns))
-			for i, c := range insertColumns {
-				colList[i] = quoteIdent(c, dst.cfg.Driver)
-			}
-
-			loadSQL := fmt.Sprintf("LOAD DATA LOCAL INFILE '%s' INTO TABLE %s (%s) FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n'",
-				tmpFile,
-				quoteIdent(targetTable, dst.cfg.Driver),
-				strings.Join(colList, ", "))
-
-			if _, err := dst.db.ExecContext(ctx, loadSQL); err != nil {
-				return fmt.Errorf("执行 LOAD DATA INFILE 失败: %w", err)
-			}
-
-			elapsed := time.Since(startTime)
-			rate := float64(batchCount) / elapsed.Seconds()
-			log.Printf("已处理 %d 条记录 (速度: %.0f 条/秒)\n", count, rate)
-
-			csvFile.Close()
-			os.Remove(tmpFile)
-
-			csvFile, err = os.Create(tmpFile)
-			if err != nil {
-				return fmt.Errorf("重新创建临时 CSV 文件失败: %w", err)
-			}
-			csvWriter = csv.NewWriter(csvFile)
-			csvWriter.Comma = ','
-			csvWriter.UseCRLF = false
-
-			batchCount = 0
-			startTime = time.Now()
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("遍历源表行时出错: %w", err)
-	}
-
-	csvWriter.Flush()
-	if err := csvWriter.Error(); err != nil {
-		return fmt.Errorf("最终刷新 CSV 数据失败: %w", err)
-	}
-
-	if batchCount > 0 {
-		colList := make([]string, len(insertColumns))
-		for i, c := range insertColumns {
-			colList[i] = quoteIdent(c, dst.cfg.Driver)
-		}
-
-		loadSQL := fmt.Sprintf("LOAD DATA LOCAL INFILE '%s' INTO TABLE %s (%s) FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n'",
-			tmpFile,
-			quoteIdent(targetTable, dst.cfg.Driver),
-			strings.Join(colList, ", "))
-
-		if _, err := dst.db.ExecContext(ctx, loadSQL); err != nil {
-			return fmt.Errorf("执行最终 LOAD DATA INFILE 失败: %w", err)
-		}
-	}
-
-	log.Printf("表 %s 复制完成，总共处理 %d 条记录\n", opts.Table, count)
-	return nil
-}
-
-// formatValueForCSV 将值格式化为 CSV 格式
-func formatValueForCSV(v interface{}) string {
-	if v == nil {
-		return "\\N"
-	}
-
-	switch val := v.(type) {
-	case []byte:
-		return string(val)
-	case time.Time:
-		return val.Format("2006-01-02 15:04:05.999999999")
-	default:
-		return fmt.Sprintf("%v", val)
-	}
-}
-
-// copyTableWithInsert 使用传统 INSERT 方式复制数据（兼容非 PostgreSQL 数据库）
-func copyTableWithInsert(ctx context.Context, src, dst *simpleDB, rows *sql.Rows, cols, insertColumns []string, targetTable string, opts copyTableOptions) error {
-	log.Printf("使用传统 INSERT 方式进行数据迁移\n")
-
-	driver := normalizeDriver(dst.cfg.Driver)
-	useMultiInsert := (driver == "mysql" || driver == "postgres" || driver == "postgresql") && len(insertColumns) > 0
-
-	var insertSQL string
-	var err error
-
-	if useMultiInsert {
-		insertSQL, err = buildMultiInsertSQL(targetTable, insertColumns, opts.BatchSize, driver)
-	} else {
-		insertSQL, err = buildInsertSQL(targetTable, insertColumns, driver)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	if opts.DryRun {
-		log.Println("Dry-Run 模式，仅打印将执行的 INSERT SQL：")
-		log.Println(insertSQL)
-	}
-
-	tx, err := dst.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("开启目标库事务失败: %w", err)
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	valuePtrs := make([]interface{}, len(cols))
-	valueHolders := make([]interface{}, len(cols))
-
-	count := 0
-	batchCount := 0
-	startTime := time.Now()
-
-	var batchArgs []interface{}
-
-	for rows.Next() {
-		for i := range valueHolders {
-			valueHolders[i] = nil
-			valuePtrs[i] = &valueHolders[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return fmt.Errorf("扫描源表行失败: %w", err)
-		}
-
-		args := reorderArgs(cols, insertColumns, valueHolders, opts)
-
-		if opts.DryRun {
-			if count < 5 {
-				log.Printf("示例行 %d: %v\n", count+1, args)
-			}
-		} else {
-			if useMultiInsert {
-				batchArgs = append(batchArgs, args...)
-				batchCount++
-				count++
-
-				if batchCount >= opts.BatchSize {
-					if _, err := tx.ExecContext(ctx, insertSQL, batchArgs...); err != nil {
-						return fmt.Errorf("批量插入目标库失败: %w", err)
-					}
-
-					elapsed := time.Since(startTime)
-					rate := float64(batchCount) / elapsed.Seconds()
-					log.Printf("已提交 %d 条记录 (速度: %.0f 条/秒)\n", count, rate)
-
-					batchArgs = batchArgs[:0]
-					batchCount = 0
-					startTime = time.Now()
-				}
-			} else {
-				if _, err := tx.ExecContext(ctx, insertSQL, args...); err != nil {
-					return fmt.Errorf("插入目标库失败: %w", err)
-				}
-				count++
-				batchCount++
-			}
-		}
-
-		if !useMultiInsert && !opts.DryRun && batchCount >= opts.BatchSize {
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("提交事务失败: %w", err)
-			}
-
-			elapsed := time.Since(startTime)
-			rate := float64(batchCount) / elapsed.Seconds()
-			log.Printf("已提交 %d 条记录 (速度: %.0f 条/秒)\n", count, rate)
-
-			tx, err = dst.db.BeginTx(ctx, nil)
-			if err != nil {
-				return fmt.Errorf("开启新事务失败: %w", err)
-			}
-			batchCount = 0
-			startTime = time.Now()
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("遍历源表行时出错: %w", err)
-	}
-
-	if !opts.DryRun {
-		if useMultiInsert && len(batchArgs) > 0 {
-			finalSQL, _ := buildMultiInsertSQL(targetTable, insertColumns, len(batchArgs)/len(insertColumns), driver)
-			if _, err := tx.ExecContext(ctx, finalSQL, batchArgs...); err != nil {
-				return fmt.Errorf("最终批量插入目标库失败: %w", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("最终提交事务失败: %w", err)
-		}
-	}
-
-	log.Printf("表 %s 复制完成，总共处理 %d 条记录\n", opts.Table, count)
-	return nil
-}
